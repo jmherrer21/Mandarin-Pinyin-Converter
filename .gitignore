@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+output/
+
+# vcpkg package manager (run `vcpkg install` to restore)
+vcpkg/
+
+# Pre-built TTS binaries (distribute separately)
+piper/
+
+# Installer binaries
+installer/*.exe
+installer/vc_redist.x64.exe
+
+# Test/sample PDFs
+data/*.pdf
+data/*.wav
+
+# Compiled output
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Markdown docs
+*.md
+
+# IDE
+.vscode/
+*.user
+.vs/
