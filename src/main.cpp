@@ -1,10 +1,10 @@
 ﻿#define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <commdlg.h>
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <windows.h>
 
 #include <algorithm>
 #include <atomic>
