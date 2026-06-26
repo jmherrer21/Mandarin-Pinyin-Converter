@@ -13,6 +13,7 @@ add_executable(mandarin-pdf-reader WIN32
     src/pdf_extractor.cpp
     src/renderer.cpp
     src/tts.cpp
+    src/http_server.cpp
 )
 
 target_link_libraries(mandarin-pdf-reader PRIVATE unofficial::libmupdf::libmupdf)
@@ -20,6 +21,7 @@ target_link_libraries(mandarin-pdf-reader PRIVATE unofficial::libmupdf::libmupdf
 target_include_directories(mandarin-pdf-reader PRIVATE
     deps/cppjieba/include
     deps/limonp/include
+    deps/cpp-httplib
 )
 
 add_custom_command(TARGET mandarin-pdf-reader POST_BUILD
