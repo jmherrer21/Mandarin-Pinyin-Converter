@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -53,6 +54,10 @@ static std::wstring g_last_output;
 static std::mutex g_output_mtx;
 static std::string g_piper_exe;
 static std::string g_model_path;
+
+// Resident pipeline state, loaded once and reused across conversions.
+static std::unique_ptr<Dictionary> g_dict;
+static std::unique_ptr<Segmenter> g_seg;
 
 static std::filesystem::path exe_dir() {
   wchar_t buf[MAX_PATH];
@@ -241,14 +246,45 @@ static std::string wide_to_utf8(const std::wstring& ws) {
   return s;
 }
 
+// Segments and annotates text into blank-line-delimited paragraphs using the
+// resident dictionary and segmenter. Consecutive non-blank lines are joined
+// with a space; a blank line ends a paragraph. Mirrors the per-page logic used
+// for PDF extraction. Caller must have populated g_dict and g_seg.
+static std::vector<std::vector<AnnotatedWord>> annotate_text(
+    const std::string& text) {
+  std::vector<std::vector<AnnotatedWord>> paras;
+  std::istringstream ss(text);
+  std::string line, buf;
+  auto flush = [&]() {
+    if (!buf.empty()) {
+      auto words = annotate(g_seg->cut(buf), *g_dict);
+      if (!words.empty()) paras.push_back(std::move(words));
+      buf.clear();
+    }
+  };
+  while (std::getline(ss, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.find_first_not_of(" \t") == std::string::npos)
+      flush();
+    else
+      buf += (buf.empty() ? "" : " ") + line;
+  }
+  flush();
+  return paras;
+}
+
 static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
                        bool do_tts) {
   auto data_dir = exe_dir() / "data";
-  post_status(L"Loading dictionary...");
-  Dictionary dict = load_cedict((data_dir / "cedict_ts.u8").string());
-
-  post_status(L"Loading segmenter...");
-  Segmenter seg((data_dir / "jieba_dict").string());
+  if (!g_dict) {
+    post_status(L"Loading dictionary...");
+    g_dict = std::make_unique<Dictionary>(
+        load_cedict((data_dir / "cedict_ts.u8").string()));
+  }
+  if (!g_seg) {
+    post_status(L"Loading segmenter...");
+    g_seg = std::make_unique<Segmenter>((data_dir / "jieba_dict").string());
+  }
 
   std::filesystem::path in_path(in_w);
   std::vector<std::vector<AnnotatedWord>> paragraphs;
@@ -270,23 +306,7 @@ static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
     post_status(L"Segmenting and annotating...");
     for (const auto& page_text : pages) {
       page_breaks.push_back(static_cast<int>(paragraphs.size()));
-      std::istringstream ss(page_text);
-      std::string line, buf;
-      auto flush = [&]() {
-        if (!buf.empty()) {
-          auto words = annotate(seg.cut(buf), dict);
-          if (!words.empty()) paragraphs.push_back(std::move(words));
-          buf.clear();
-        }
-      };
-      while (std::getline(ss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty())
-          flush();
-        else
-          buf += (buf.empty() ? "" : " ") + line;
-      }
-      flush();
+      for (auto& p : annotate_text(page_text)) paragraphs.push_back(std::move(p));
     }
   } else {
     post_status(L"Reading text file...");
@@ -309,29 +329,7 @@ static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
     }
     post_status(L"Segmenting and annotating...");
     page_breaks = {0};
-    std::istringstream stream(text);
-    std::string line, buf;
-    auto flush_buf = [&]() {
-      if (!buf.empty()) {
-        auto words = annotate(seg.cut(buf), dict);
-        if (!words.empty()) paragraphs.push_back(std::move(words));
-        buf.clear();
-      }
-    };
-    while (std::getline(stream, line)) {
-      if (!line.empty() && line.back() == '\r') line.pop_back();
-      if (line.empty()) {
-        flush_buf();
-        continue;
-      }
-      size_t s = line.find_first_not_of(" \t");
-      if (s == std::string::npos) {
-        flush_buf();
-        continue;
-      }
-      buf += line.substr(s);
-      flush_buf();
-    }
+    for (auto& p : annotate_text(text)) paragraphs.push_back(std::move(p));
   }
 
   std::filesystem::path out_path(out_w);
