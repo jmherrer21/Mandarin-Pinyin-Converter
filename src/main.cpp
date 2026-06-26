@@ -8,11 +8,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -59,6 +62,20 @@ static std::string g_model_path;
 // Resident pipeline state, loaded once and reused across conversions.
 static std::unique_ptr<Dictionary> g_dict;
 static std::unique_ptr<Segmenter> g_seg;
+
+// In-memory model of the document currently open in the reader. Editing the
+// raw text re-annotates a paragraph and updates this model (export-only; the
+// source file is never touched). g_session_mtx guards the session and
+// serializes save requests, which mutate the shared model.
+struct DocumentSession {
+  std::string source_type;  // "txt" | "docx" | "pdf"
+  bool editable = false;
+  std::vector<std::vector<AnnotatedWord>> paragraphs;  // mirrors window._P
+  std::string token;  // required on edit-API requests
+  bool dirty = false;
+};
+static std::unique_ptr<DocumentSession> g_session;
+static std::mutex g_session_mtx;
 
 // Loopback server that serves the reader over http:// so the browser can play
 // the generated audio (file:// blocks it). Stays alive while a doc is open.
@@ -278,6 +295,220 @@ static std::vector<std::vector<AnnotatedWord>> annotate_text(
   return paras;
 }
 
+// Per-session token gating the edit API. NOT a security boundary: it is seeded
+// from 64 bits via a non-cryptographic PRNG and is readable by any local
+// process that can fetch the served page. Its only job is to stop cross-origin
+// web pages (which cannot read the page) from driving the loopback edit API.
+static std::string make_token() {
+  std::random_device rd;
+  std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ rd());
+  static const char* hx = "0123456789abcdef";
+  std::string t;
+  for (int i = 0; i < 32; ++i) t += hx[gen() & 0xF];
+  return t;
+}
+
+static void append_utf8(std::string& out, unsigned cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+// Minimal parser for the small, fixed request shape {index, text, token}.
+// Parses a flat JSON object's string and scalar members into `out` (key ->
+// decoded string for strings, raw token for numbers/literals). Returns false on
+// malformed input or nested values. Sufficient and correct for our own client.
+static bool parse_flat_object(const std::string& s,
+                              std::map<std::string, std::string>& out) {
+  size_t i = 0;
+  auto ws = [&]() {
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r'))
+      ++i;
+  };
+  auto parse_string = [&](std::string& v) -> bool {
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    v.clear();
+    while (i < s.size()) {
+      char c = s[i++];
+      if (c == '"') return true;
+      if (c != '\\') {
+        v += c;
+        continue;
+      }
+      if (i >= s.size()) return false;
+      char e = s[i++];
+      switch (e) {
+        case '"': v += '"'; break;
+        case '\\': v += '\\'; break;
+        case '/': v += '/'; break;
+        case 'n': v += '\n'; break;
+        case 'r': v += '\r'; break;
+        case 't': v += '\t'; break;
+        case 'b': v += '\b'; break;
+        case 'f': v += '\f'; break;
+        case 'u': {
+          if (i + 4 > s.size()) return false;
+          unsigned cp = 0;
+          for (int k = 0; k < 4; ++k) {
+            char h = s[i++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9')
+              cp |= h - '0';
+            else if (h >= 'a' && h <= 'f')
+              cp |= h - 'a' + 10;
+            else if (h >= 'A' && h <= 'F')
+              cp |= h - 'A' + 10;
+            else
+              return false;
+          }
+          // Combine a UTF-16 surrogate pair if present.
+          if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 <= s.size() &&
+              s[i] == '\\' && s[i + 1] == 'u') {
+            unsigned lo = 0;
+            size_t j = i + 2;
+            bool ok = true;
+            for (int k = 0; k < 4; ++k) {
+              char h = s[j++];
+              lo <<= 4;
+              if (h >= '0' && h <= '9')
+                lo |= h - '0';
+              else if (h >= 'a' && h <= 'f')
+                lo |= h - 'a' + 10;
+              else if (h >= 'A' && h <= 'F')
+                lo |= h - 'A' + 10;
+              else {
+                ok = false;
+                break;
+              }
+            }
+            if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+              i = j;
+            }
+          }
+          append_utf8(v, cp);
+          break;
+        }
+        default:
+          return false;
+      }
+    }
+    return false;  // unterminated string
+  };
+
+  ws();
+  if (i >= s.size() || s[i] != '{') return false;
+  ++i;
+  ws();
+  if (i < s.size() && s[i] == '}') return true;  // empty object
+  while (true) {
+    ws();
+    std::string key;
+    if (!parse_string(key)) return false;
+    ws();
+    if (i >= s.size() || s[i] != ':') return false;
+    ++i;
+    ws();
+    if (i >= s.size()) return false;
+    if (s[i] == '"') {
+      std::string val;
+      if (!parse_string(val)) return false;
+      out[key] = std::move(val);
+    } else if (s[i] == '{' || s[i] == '[') {
+      return false;  // nested values not supported
+    } else {
+      size_t start = i;
+      while (i < s.size() && s[i] != ',' && s[i] != '}') ++i;
+      std::string val = s.substr(start, i - start);
+      while (!val.empty() && (val.back() == ' ' || val.back() == '\t' ||
+                              val.back() == '\n' || val.back() == '\r'))
+        val.pop_back();
+      out[key] = std::move(val);
+    }
+    ws();
+    if (i >= s.size()) return false;
+    if (s[i] == ',') {
+      ++i;
+      continue;
+    }
+    if (s[i] == '}') return true;
+    return false;
+  }
+}
+
+// POST /api/paragraph handler. Validates the session token and UTF-8, re-
+// annotates the edited text, splices the result into the in-memory model, and
+// returns the new _P/_R-shaped JSON. No disk write (v1 is export-only).
+static std::string handle_paragraph(const std::string& body) {
+  std::map<std::string, std::string> obj;
+  if (!parse_flat_object(body, obj))
+    return R"({"ok":false,"error":"Malformed request."})";
+  auto tok_it = obj.find("token");
+  auto txt_it = obj.find("text");
+  auto idx_it = obj.find("index");
+  if (tok_it == obj.end() || txt_it == obj.end() || idx_it == obj.end())
+    return R"({"ok":false,"error":"Missing field."})";
+
+  std::lock_guard<std::mutex> lk(g_session_mtx);
+  if (!g_session) return R"({"ok":false,"error":"No document open."})";
+  if (tok_it->second != g_session->token)
+    return R"({"ok":false,"error":"Invalid token."})";
+  if (!g_session->editable)
+    return R"({"ok":false,"error":"Document is not editable."})";
+  if (!is_valid_utf8(txt_it->second))
+    return R"({"ok":false,"error":"Text is not valid UTF-8."})";
+
+  char* end = nullptr;
+  long index = std::strtol(idx_it->second.c_str(), &end, 10);
+  if (end == idx_it->second.c_str() || *end != '\0')
+    return R"({"ok":false,"error":"Invalid index."})";
+  auto& model = g_session->paragraphs;
+  if (index < 0 || index >= static_cast<long>(model.size()))
+    return R"({"ok":false,"error":"Paragraph index out of range."})";
+
+  auto new_paras = annotate_text(txt_it->second);
+  ParagraphsJson pj = build_paragraphs_json(new_paras);
+  int replaced = static_cast<int>(new_paras.size());
+
+  model.erase(model.begin() + index);
+  model.insert(model.begin() + index,
+               std::make_move_iterator(new_paras.begin()),
+               std::make_move_iterator(new_paras.end()));
+  g_session->dirty = true;
+
+  return "{\"ok\":true,\"paragraphs\":" + pj.paragraphs +
+         ",\"readings\":" + pj.readings +
+         ",\"replacedCount\":" + std::to_string(replaced) + "}";
+}
+
+// GET /api/status handler. Reports session state for the reader/edit UI.
+static std::string handle_status() {
+  std::lock_guard<std::mutex> lk(g_session_mtx);
+  if (!g_session)
+    return R"({"editable":false,"sourceType":"","dirty":false})";
+  std::string s = "{\"editable\":";
+  s += g_session->editable ? "true" : "false";
+  s += ",\"sourceType\":" + json_str(g_session->source_type);
+  s += ",\"dirty\":";
+  s += g_session->dirty ? "true" : "false";
+  s += "}";
+  return s;
+}
+
 static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
                        bool do_tts) {
   auto data_dir = exe_dir() / "data";
@@ -337,6 +568,24 @@ static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
     for (auto& p : annotate_text(text)) paragraphs.push_back(std::move(p));
   }
 
+  // Establish the editable session: the in-memory model + per-session token.
+  // PDF stays read-only; text sources are editable. The model owns its own copy
+  // so later edits never disturb the rendered/exported `paragraphs` here.
+  std::string source_type = (ext == L".pdf") ? "pdf" : "txt";
+  EditConfig edit_cfg;
+  edit_cfg.source_type = source_type;
+  edit_cfg.editable = source_type != "pdf";
+  edit_cfg.token = make_token();
+  {
+    std::lock_guard<std::mutex> lk(g_session_mtx);
+    auto sess = std::make_unique<DocumentSession>();
+    sess->source_type = source_type;
+    sess->editable = edit_cfg.editable;
+    sess->paragraphs = paragraphs;
+    sess->token = edit_cfg.token;
+    g_session = std::move(sess);
+  }
+
   std::filesystem::path out_path(out_w);
   if (auto p = out_path.parent_path(); !p.empty())
     std::filesystem::create_directories(p);
@@ -355,7 +604,7 @@ static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
   }
 
   post_status(L"Writing HTML...");
-  std::string html = render_html(paragraphs, audio_map, page_breaks);
+  std::string html = render_html(paragraphs, audio_map, page_breaks, edit_cfg);
   std::ofstream ofs(out_path);
   if (!ofs) {
     post_status(L"Cannot write output file.", 2);
@@ -674,6 +923,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
                            L"Mandarin Pinyin Converter", WS_OVERLAPPEDWINDOW,
                            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                            r.bottom - r.top, nullptr, nullptr, hInst, nullptr);
+
+  g_server.set_api_handlers(handle_paragraph, handle_status);
 
   ShowWindow(g_hwnd, nShow);
   UpdateWindow(g_hwnd);

@@ -75,7 +75,7 @@ static std::string html_escape(const std::string& s) {
   return out;
 }
 
-static std::string json_str(const std::string& s) {
+std::string json_str(const std::string& s) {
   std::string out = "\"";
   for (unsigned char c : s) {
     if (c == '"')
@@ -308,10 +308,67 @@ static std::string readings_to_json(const std::vector<DictEntry>& readings) {
   return out;
 }
 
+// Builds the window._P-shaped "[...]" array for paragraphs, accumulating any
+// readings encountered into readings_dict (word -> readings JSON).
+static std::string paragraphs_array_js(
+    const std::vector<std::vector<AnnotatedWord>>& paragraphs,
+    const std::map<std::string, std::string>& audio_map,
+    std::map<std::string, std::string>& readings_dict) {
+  std::string out = "[";
+  bool fp = true;
+  for (const auto& para : paragraphs) {
+    if (!fp) out += ',';
+    fp = false;
+    out += '[';
+    bool fw = true;
+    for (const auto& w : para) {
+      if (!fw) out += ',';
+      fw = false;
+      if (!w.is_hanzi || w.pinyin.empty()) {
+        out += json_str(w.text);
+      } else {
+        std::string py = pinyin_to_accented(w.pinyin);
+        if (!readings_dict.count(w.text))
+          readings_dict[w.text] = readings_to_json(w.all_readings);
+        auto ait = audio_map.find(w.text);
+        out += '[' + json_str(w.text) + ',' + json_str(py);
+        if (ait != audio_map.end()) out += ',' + json_str(ait->second);
+        out += ']';
+      }
+    }
+    out += ']';
+  }
+  out += ']';
+  return out;
+}
+
+// Builds the window._R-shaped "{...}" object from an accumulated readings map.
+static std::string readings_object_js(
+    const std::map<std::string, std::string>& readings_dict) {
+  std::string out = "{";
+  bool fe = true;
+  for (const auto& [word, json] : readings_dict) {
+    if (!fe) out += ',';
+    fe = false;
+    out += json_str(word) + ':' + json;
+  }
+  out += '}';
+  return out;
+}
+
+ParagraphsJson build_paragraphs_json(
+    const std::vector<std::vector<AnnotatedWord>>& paragraphs) {
+  std::map<std::string, std::string> readings_dict;
+  ParagraphsJson r;
+  r.paragraphs = paragraphs_array_js(paragraphs, {}, readings_dict);
+  r.readings = readings_object_js(readings_dict);
+  return r;
+}
+
 std::string render_html(
     const std::vector<std::vector<AnnotatedWord>>& paragraphs,
     const std::map<std::string, std::string>& audio_map,
-    const std::vector<int>& page_breaks) {
+    const std::vector<int>& page_breaks, const EditConfig& edit) {
   // Build compact paragraph data (window._P), deduplicated readings
   // (window._R), and PDF page-break indices (window._PB) in one pass. The JS
   // paginator uses _PB to show exactly one PDF page at a time.
@@ -324,40 +381,11 @@ std::string render_html(
   // window._PB format — [0, 5, 12, ...] index into _P of first para on each PDF
   // page.
   std::map<std::string, std::string> readings_dict;
-  std::string paras_js = "window._P=[";
-  bool fp = true;
-  for (const auto& para : paragraphs) {
-    if (!fp) paras_js += ',';
-    fp = false;
-    paras_js += '[';
-    bool fw = true;
-    for (const auto& w : para) {
-      if (!fw) paras_js += ',';
-      fw = false;
-      if (!w.is_hanzi || w.pinyin.empty()) {
-        paras_js += json_str(w.text);
-      } else {
-        std::string py = pinyin_to_accented(w.pinyin);
-        if (!readings_dict.count(w.text))
-          readings_dict[w.text] = readings_to_json(w.all_readings);
-        auto ait = audio_map.find(w.text);
-        paras_js += '[' + json_str(w.text) + ',' + json_str(py);
-        if (ait != audio_map.end()) paras_js += ',' + json_str(ait->second);
-        paras_js += ']';
-      }
-    }
-    paras_js += ']';
-  }
-  paras_js += "];";
-
-  std::string readings_js = "window._R={";
-  bool fe = true;
-  for (const auto& [word, json] : readings_dict) {
-    if (!fe) readings_js += ',';
-    fe = false;
-    readings_js += json_str(word) + ':' + json;
-  }
-  readings_js += "};";
+  std::string paras_js =
+      "window._P=" + paragraphs_array_js(paragraphs, audio_map, readings_dict) +
+      ";";
+  std::string readings_js =
+      "window._R=" + readings_object_js(readings_dict) + ";";
 
   // page-break index array; guarantee at least one entry.
   std::string pb_js = "window._PB=[";
@@ -370,6 +398,13 @@ std::string render_html(
     }
   }
   pb_js += "];";
+
+  // Reader/edit config (window._EDIT). Carries the per-session token the edit
+  // API requires; the edit UI itself is added in a later stage.
+  std::string edit_js = "window._EDIT={editable:";
+  edit_js += edit.editable ? "true" : "false";
+  edit_js += ",sourceType:" + json_str(edit.source_type);
+  edit_js += ",token:" + json_str(edit.token) + "};";
 
   std::string html;
   html += "<!DOCTYPE html>\n<html lang=\"zh-Hans\">\n<head>\n";
@@ -413,7 +448,8 @@ std::string render_html(
   html += ".para-play:hover{opacity:1;background:#e8f4fd;}\n";
   html += "#stop-btn{padding:.25em .35em;cursor:pointer;}\n";
   html += "</style>\n";
-  html += "<script>" + paras_js + readings_js + pb_js + "</script>\n";
+  html +=
+      "<script>" + paras_js + readings_js + pb_js + edit_js + "</script>\n";
   html += "</head>\n<body>\n";
   html +=
       "<div id=\"nav\">"

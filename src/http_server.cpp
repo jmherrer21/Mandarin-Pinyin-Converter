@@ -12,9 +12,11 @@ struct HttpServer::Impl {
   httplib::Server svr;
   std::thread thread;
   std::mutex life_mtx;  // guards start/stop (port_ + thread)
-  std::mutex mtx;       // guards html + audio_dir
+  std::mutex mtx;       // guards html + audio_dir + handlers
   std::string html;
   fs::path audio_dir;
+  HttpServer::ParagraphHandler paragraph_handler;
+  HttpServer::StatusHandler status_handler;
 };
 
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
@@ -25,6 +27,13 @@ void HttpServer::set_document(std::string html, fs::path audio_dir) {
   std::lock_guard<std::mutex> lk(impl_->mtx);
   impl_->html = std::move(html);
   impl_->audio_dir = std::move(audio_dir);
+}
+
+void HttpServer::set_api_handlers(ParagraphHandler paragraph,
+                                  StatusHandler status) {
+  std::lock_guard<std::mutex> lk(impl_->mtx);
+  impl_->paragraph_handler = std::move(paragraph);
+  impl_->status_handler = std::move(status);
 }
 
 int HttpServer::start() {
@@ -66,6 +75,35 @@ int HttpServer::start() {
                   }
                   std::string data((std::istreambuf_iterator<char>(f)), {});
                   res.set_content(std::move(data), "audio/wav");
+                });
+
+  // Re-annotate the edited paragraph (in-memory only). Token-gated server-side.
+  impl->svr.Post("/api/paragraph",
+                 [impl](const httplib::Request& req, httplib::Response& res) {
+                   HttpServer::ParagraphHandler h;
+                   {
+                     std::lock_guard<std::mutex> lk(impl->mtx);
+                     h = impl->paragraph_handler;
+                   }
+                   if (!h) {
+                     res.status = 503;
+                     return;
+                   }
+                   res.set_content(h(req.body), "application/json");
+                 });
+
+  impl->svr.Get("/api/status",
+                [impl](const httplib::Request&, httplib::Response& res) {
+                  HttpServer::StatusHandler h;
+                  {
+                    std::lock_guard<std::mutex> lk(impl->mtx);
+                    h = impl->status_handler;
+                  }
+                  if (!h) {
+                    res.status = 503;
+                    return;
+                  }
+                  res.set_content(h(), "application/json");
                 });
 
   int port = impl->svr.bind_to_any_port("127.0.0.1");
