@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "dictionary.hpp"
+#include "http_server.hpp"
 #include "pdf_extractor.hpp"
 #include "renderer.hpp"
 #include "segmenter.hpp"
@@ -58,6 +59,10 @@ static std::string g_model_path;
 // Resident pipeline state, loaded once and reused across conversions.
 static std::unique_ptr<Dictionary> g_dict;
 static std::unique_ptr<Segmenter> g_seg;
+
+// Loopback server that serves the reader over http:// so the browser can play
+// the generated audio (file:// blocks it). Stays alive while a doc is open.
+static HttpServer g_server;
 
 static std::filesystem::path exe_dir() {
   wchar_t buf[MAX_PATH];
@@ -350,19 +355,28 @@ static bool do_convert(std::wstring in_w, std::wstring out_w, bool gen_pdf,
   }
 
   post_status(L"Writing HTML...");
+  std::string html = render_html(paragraphs, audio_map, page_breaks);
   std::ofstream ofs(out_path);
   if (!ofs) {
     post_status(L"Cannot write output file.", 2);
     return false;
   }
-  ofs << render_html(paragraphs, audio_map, page_breaks);
+  ofs << html;
   ofs.close();
 
+  // Serve the just-written document over loopback HTTP and open it via
+  // http:// rather than file:// so the browser can fetch the TTS audio. The
+  // single server is reused across conversions; the latest document wins.
+  g_server.set_document(std::move(html), out_path.parent_path() / "audio");
+  int port = g_server.start();
+
   // Set g_last_output before the PDF block so "Open result" works even if PDF
-  // export fails.
+  // export fails. Fall back to the file path if the server failed to start.
   {
     std::lock_guard<std::mutex> lk(g_output_mtx);
-    g_last_output = out_path.wstring();
+    g_last_output = port > 0 ? L"http://127.0.0.1:" + std::to_wstring(port) +
+                                   L"/"
+                             : out_path.wstring();
   }
 
   if (gen_pdf) {
@@ -607,6 +621,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
       g_hwnd = nullptr;
+      g_server.stop();
       PostQuitMessage(0);
       break;
   }
